@@ -155,8 +155,9 @@ def build_default_config() -> dict:
         # The configured value is the exact vendor chain — requests are NOT silently
         # routed to vendors you didn't choose. A comma falls back: the next vendor
         # is asked only when the previous one could not serve the call. A plus
-        # merges: the next vendor fills a gap the previous one left (a refusal, an
-        # outage, an empty payload) and never replaces data already served.
+        # merges: every vendor in the group is called on every run, the first one
+        # listed is the primary whose answer stands, and the rest contribute only
+        # what it lacks — data already served is never replaced.
         # "default" uses all available vendors.
         "data_vendors": {
             # Yahoo answers first wherever it has a vendor; Alpha Vantage sits
