@@ -153,15 +153,21 @@ def build_default_config() -> dict:
         # Data vendor configuration
         # Category-level configuration (default for all tools in category).
         # The configured value is the exact vendor chain — requests are NOT silently
-        # routed to vendors you didn't choose. For ordered fallback, list several,
-        # e.g. "yfinance,alpha_vantage". "default" uses all available vendors.
+        # routed to vendors you didn't choose. A comma falls back: the next vendor
+        # is asked only when the previous one could not serve the call. A plus
+        # merges: the next vendor fills a gap the previous one left (a refusal, an
+        # outage, an empty payload) and never replaces data already served.
+        # "default" uses all available vendors.
         "data_vendors": {
-            "core_stock_apis": "yfinance",       # Options: alpha_vantage, yfinance
-            "technical_indicators": "yfinance",  # Options: alpha_vantage, yfinance
-            # Statements come from SEC EDGAR as filed (US filers), then Yahoo; the
-        # overview and insider tools, which SEC EDGAR does not serve, from Yahoo.
-        "fundamental_data": "sec_edgar,yfinance",  # Options: sec_edgar, alpha_vantage, yfinance
-            "news_data": "yfinance",             # Options: alpha_vantage, yfinance
+            # Yahoo answers first wherever it has a vendor; Alpha Vantage sits
+            # after a "+" so it fills a gap without replacing a Yahoo answer
+            # that already carried data.
+            "core_stock_apis": "yfinance+alpha_vantage",       # Options: alpha_vantage, yfinance
+            "technical_indicators": "yfinance+alpha_vantage",  # Options: alpha_vantage, yfinance
+            # Statements come from SEC EDGAR as filed (US filers), then Yahoo and
+            # Alpha Vantage for the overview and insider tools EDGAR does not serve.
+            "fundamental_data": "sec_edgar,yfinance+alpha_vantage",  # Options: sec_edgar, alpha_vantage, yfinance
+            "news_data": "yfinance+alpha_vantage",             # Options: alpha_vantage, yfinance
             "macro_data": "fred",                # Options: fred (needs FRED_API_KEY)
             "prediction_markets": "polymarket",  # Options: polymarket (keyless)
         },

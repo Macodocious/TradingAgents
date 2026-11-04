@@ -197,11 +197,29 @@ def no_data_available(error: NoMarketDataError) -> str:
     )
 
 
+# A vendor answer that carries no data: a point-in-time withholding notice, an
+# all-vendor-unavailable sentinel, or an empty payload. These are the gaps a
+# later vendor in the chain is allowed to fill.
+_GAP_MARKERS = ("# Point-in-time as of:", "DATA_UNAVAILABLE", "NO_DATA_AVAILABLE")
+
+
+def _is_gap(result) -> bool:
+    """True when a vendor answered without serving any data."""
+    if result is None:
+        return True
+    if isinstance(result, dict):
+        return not result
+    if isinstance(result, str):
+        text = result.strip()
+        return not text or any(marker in text[:400] for marker in _GAP_MARKERS)
+    return False
+
+
 def route_to_vendor(method: str, *args, **kwargs):
     """Route method calls to appropriate vendor implementation with fallback support."""
     category = get_category_for_method(method)
     vendor_config = get_vendor(category, method)
-    primary_vendors = [v.strip() for v in vendor_config.split(',')]
+    primary_vendors = [v.strip() for v in vendor_config.replace("+", ",").split(",")]
 
     if method not in VENDOR_METHODS:
         raise ValueError(f"Method '{method}' not supported")
@@ -228,12 +246,13 @@ def route_to_vendor(method: str, *args, **kwargs):
     last_unavailable: VendorUnavailableError | None = None
     failed: Exception | None = None     # a vendor that raised something untyped
     first_error: Exception | None = None
+    gap_result: str | None = None    # last answer that carried no data
     for vendor in vendor_chain:
         vendor_impl = VENDOR_METHODS[method][vendor]
         impl_func = vendor_impl[0] if isinstance(vendor_impl, list) else vendor_impl
 
         try:
-            return impl_func(*args, **kwargs)
+            result = impl_func(*args, **kwargs)
         except VendorUnavailableError as e:
             logger.warning("Vendor %r unavailable for %s: %s; trying next vendor.", vendor, method, e)
             # Kept so an all-unavailable chain can say the vendor was the
@@ -257,6 +276,14 @@ def route_to_vendor(method: str, *args, **kwargs):
                 first_error = e
             failed = e
             continue
+        if _is_gap(result):
+            logger.info(
+                "Vendor %r answered %s with no data; the next vendor in the chain may fill it.",
+                vendor, method,
+            )
+            gap_result = result
+            continue
+        return result
 
     # A vendor that throttled or failed the request never said whether it has
     # the symbol, so no other vendor's "no data" can speak for the whole chain:
@@ -264,7 +291,7 @@ def route_to_vendor(method: str, *args, **kwargs):
     # the run either.
     if last_unavailable is not None:
         return vendor_unavailable(method, last_unavailable)
-    if failed is not None and last_no_data is not None:
+    if failed is not None and (last_no_data is not None or gap_result is not None):
         return vendor_unavailable(method, failed)
 
     # Every vendor that answered reported "no data": the symbol is genuinely unavailable.
@@ -280,6 +307,11 @@ def route_to_vendor(method: str, *args, **kwargs):
                 method, first_error,
             )
         return no_data_available(last_no_data)
+
+    # Every vendor answered without serving data: hand back the last notice so
+    # the agent sees the real reason (point-in-time withholding included).
+    if gap_result is not None:
+        return gap_result
 
     # No vendor returned data and none reported clean "no data" — surface the
     # first real error (e.g. the primary vendor's network failure). Optional
