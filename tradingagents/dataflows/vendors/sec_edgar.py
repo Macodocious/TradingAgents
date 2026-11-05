@@ -29,6 +29,7 @@ import requests
 
 from tradingagents import __version__
 from tradingagents.dataflows.config import get_config
+from tradingagents.dataflows import fx
 from tradingagents.dataflows.errors import NoMarketDataError, VendorUnavailableError
 from tradingagents.dataflows.files import replace_file
 
@@ -261,9 +262,41 @@ def _statement(kind: str, ticker: str, freq: str, as_of_date: str, title: str) -
         raise NoMarketDataError(ticker, ticker, f"no {freq} {title.lower()} filed by {as_of_date}")
     tagged = {label: line for label, line in lines.items() if line[0]}
     untagged = [label for label in lines if label not in tagged]
+
+    # A statement reports in its filing's currency while the listing quotes in
+    # another; a multiple built by dividing one by the other is wrong by the
+    # exchange rate, so the figures are converted to the quote currency and the
+    # rate is stated. When no rate is available the figures stay as filed and
+    # the header says so, rather than presenting a mixed-currency column.
+    target_currency = fx.quote_currency(ticker)
+    statement_units = {unit.split("/")[0] for _, unit in tagged.values() if unit}
+    conversion_note = ""
+    if len(statement_units) == 1:
+        source_currency = next(iter(statement_units))
+        if source_currency != target_currency:
+            rate = fx.fx_rate(source_currency, target_currency, as_of_date)
+            if rate is None:
+                conversion_note = (
+                    f"# No {source_currency}->{target_currency} rate available for "
+                    f"{as_of_date}; figures remain in {source_currency}\n"
+                )
+            else:
+                rate_on = fx.rate_date(source_currency, target_currency, as_of_date) or as_of_date
+                for label, (values, unit) in list(tagged.items()):
+                    per_share = f"/{unit.split('/', 1)[1]}" if "/" in unit else ""
+                    tagged[label] = (
+                        {key: fx.convert(value, rate) for key, value in values.items()},
+                        f"{target_currency}{per_share}",
+                    )
+                conversion_note = (
+                    f"# Converted from {source_currency} at {rate:.4f} {target_currency} "
+                    f"per {source_currency} ({rate_on})\n"
+                )
+
     header = (
-        f"# {title} for {ticker.upper()} ({freq}), USD in millions unless the column says otherwise\n"
+        f"# {title} for {ticker.upper()} ({freq}), millions in the currency each column names\n"
         f"# SEC EDGAR facts filed on or before {as_of_date}, at the values filed then\n"
+        + conversion_note
         + (f"# Not tagged by this filer: {', '.join(untagged)}\n" if untagged else "")
         + "\n"
     )
