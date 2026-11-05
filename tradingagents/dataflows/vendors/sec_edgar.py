@@ -73,6 +73,29 @@ _STATEMENTS: dict[str, list[tuple[str, tuple[str, ...]]]] = {
     ],
 }
 
+# A 40-F filer reporting under IFRS tags its statements in the ifrs-full
+# namespace instead of us-gaap; Canadian banks are the common case. Only the
+# lines such filers actually tag are listed, so a line they never report reads
+# as untagged rather than as zero. Canadian banks present in liquidity order, so
+# current assets and liabilities have no IFRS element at all.
+_IFRS_STATEMENTS: dict[str, list[tuple[str, tuple[str, ...]]]] = {
+    "balance_sheet": [
+        ("Total Assets", ("Assets",)),
+        ("Cash and Equivalents", ("CashAndCashEquivalents",)),
+        ("Total Liabilities", ("Liabilities",)),
+        ("Stockholders Equity", ("Equity", "EquityAttributableToOwnersOfParent")),
+    ],
+    "income_statement": [
+        ("Revenue", ("Revenue",)),
+        ("Net Income", ("ProfitLoss", "ProfitLossAttributableToOwnersOfParent")),
+    ],
+    "cashflow": [
+        ("Operating Cash Flow", ("CashFlowsFromUsedInOperatingActivities",)),
+        ("Investing Cash Flow", ("CashFlowsFromUsedInInvestingActivities",)),
+        ("Financing Cash Flow", ("CashFlowsFromUsedInFinancingActivities",)),
+    ],
+}
+
 # A statement's figures cover a span: a quarter is about 90 days, a year about
 # 365. One filing reports both the quarter and the year to date under the same
 # end date, so a match on the end date alone can report half a year as a quarter.
@@ -208,9 +231,15 @@ def _statement(kind: str, ticker: str, freq: str, as_of_date: str, title: str) -
         raise NoMarketDataError(ticker, ticker, "not a US SEC filer")
 
     facts = _cached_json(_FACTS_URL.format(cik=cik), f"CIK{cik}.json")
-    us_gaap = (facts.get("facts") or {}).get("us-gaap")
-    if not us_gaap:
-        raise NoMarketDataError(ticker, ticker, "US filer with no us-gaap facts")
+    namespaces = facts.get("facts") or {}
+    if namespaces.get("us-gaap"):
+        company_facts, statements = namespaces["us-gaap"], _STATEMENTS
+    elif namespaces.get("ifrs-full"):
+        # A 40-F filer may report under IFRS rather than US GAAP; Canadian banks
+        # are the common case, and their lines are tagged in ifrs-full.
+        company_facts, statements = namespaces["ifrs-full"], _IFRS_STATEMENTS
+    else:
+        raise NoMarketDataError(ticker, ticker, "US filer with no us-gaap or ifrs-full facts")
 
     quarterly = freq.lower() == "quarterly"
     if quarterly:
@@ -219,7 +248,7 @@ def _statement(kind: str, ticker: str, freq: str, as_of_date: str, title: str) -
     else:
         spans, names = (_SPANS["annual"],), [""]
     forms = () if quarterly else _ANNUAL_FORMS
-    lines = {label: _as_of(us_gaap, tags, as_of_date, spans, forms) for label, tags in _STATEMENTS[kind]}
+    lines = {label: _as_of(company_facts, tags, as_of_date, spans, forms) for label, tags in statements[kind]}
     # Each row takes the shortest span it reports for a period, and a column
     # holds one span of one period, so a row filed only to date keeps its figure
     # beside a row filed by quarter.
