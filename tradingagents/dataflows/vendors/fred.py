@@ -87,6 +87,16 @@ MACRO_SERIES = {
     "germany_10y": "IRLTLT01DEM156N",
     "france_10y": "IRLTLT01FRM156N",
     "eur_usd": "DEXUSEU",
+    # Canada: Bank of Canada policy rate, OECD unemployment and long-term yield,
+    # and the CAD/USD spot rate. Canadian CPI on FRED stops at 2025-03, so the
+    # alias maps the index and the staleness shows in its last observation date
+    # rather than being hidden.
+    "boc_rate": "IRSTCI01CAM156N",
+    "canada_policy_rate": "IRSTCI01CAM156N",
+    "canada_unemployment": "LRUNTTTTCAM156S",
+    "canada_10y": "IRLTLT01CAM156N",
+    "canada_cpi": "CANCPIALLMINMEI",
+    "cad_usd": "DEXCAUS",
 }
 
 

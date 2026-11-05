@@ -134,13 +134,26 @@ def _cached_json(url: str, name: str) -> dict:
 
 
 def cik_for(ticker: str) -> str | None:
-    """The filer's CIK, or None when the ticker is not a US filer."""
+    """The filer's CIK, or None when the ticker is not a US filer.
+
+    A Canadian listing (``SHOP.TO``) is absent from SEC's table under its Yahoo
+    symbol, but a cross-listed issuer files under its bare ticker, so the suffix
+    is dropped and the base symbol retried. Both lookups stay exact matches, and
+    a base symbol the table lists more than once is refused rather than guessed:
+    two companies sharing it would otherwise resolve to whichever came first.
+    """
     table = _cached_json(_TICKERS_URL, "company_tickers.json")
     wanted = ticker.strip().upper()
-    for entry in table.values():
-        if entry.get("ticker", "").upper() == wanted:
-            return f"{int(entry['cik_str']):010d}"
-    return None
+    entries = list(table.values())
+
+    matches = [entry for entry in entries if entry.get("ticker", "").upper() == wanted]
+    if not matches and "." in wanted:
+        base = wanted.split(".", 1)[0]
+        matches = [entry for entry in entries if entry.get("ticker", "").upper() == base]
+
+    if len(matches) != 1:
+        return None
+    return f"{int(matches[0]['cik_str']):010d}"
 
 
 def _span_index(fact: dict, spans: tuple[tuple[int, int], ...]) -> int | None:

@@ -203,6 +203,7 @@ def build_default_config() -> dict:
             ".SW":  "^SSMI",       # Switzerland (SMI)
             ".MI":  "FTSEMIB.MI",  # Milan (FTSE MIB)
             ".TO":  "^GSPTSE",     # Toronto (TSX Composite)
+            ".V":   "^SPCDNX",     # TSX Venture (S&P/TSX Venture Composite)
             ".AX":  "^AXJO",       # Australia (ASX 200)
             ".SS":  "000001.SS",   # Shanghai (SSE Composite)
             ".SZ":  "399001.SZ",   # Shenzhen (SZSE Component)
