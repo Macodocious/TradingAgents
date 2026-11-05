@@ -1,5 +1,8 @@
 import json
+import logging
 import os
+import tempfile
+import time
 from datetime import datetime
 from io import StringIO
 
@@ -67,6 +70,95 @@ class AlphaVantageRateLimitError(VendorUnavailableError):
     pass
 
 
+logger = logging.getLogger(__name__)
+
+# Functions Alpha Vantage serves only on a paid plan. Asking for one on a free
+# key returns "This is a premium endpoint" and still spends a daily request, so
+# these are refused here before any network call. Verified against a free key:
+# NEWS_SENTIMENT, OVERVIEW and MACD refuse; TIME_SERIES_DAILY, SMA, RSI, BBANDS
+# and ATR answer normally.
+PREMIUM_FUNCTIONS = frozenset({"NEWS_SENTIMENT", "OVERVIEW", "MACD"})
+
+# The free plan allows 25 requests per day. A per-process counter cannot see the
+# runs before it, so the count lives in a small file keyed by UTC date.
+DAILY_REQUEST_LIMIT = int(os.getenv("ALPHA_VANTAGE_DAILY_LIMIT", "25"))
+USAGE_PATH = os.getenv("ALPHA_VANTAGE_USAGE_FILE") or os.path.join(
+    tempfile.gettempdir(), "alpha_vantage_usage.json"
+)
+
+# The free plan throttles bursts; one request per second is the advertised safe
+# pace, and this module leaves a margin on it.
+MIN_INTERVAL_SECONDS = 1.2
+_last_request_at = 0.0
+
+
+class AlphaVantagePremiumError(VendorUnavailableError):
+    """Raised when a call targets a function the current plan does not include."""
+
+
+def _read_usage() -> tuple[str, int]:
+    """(date, count) from the usage file; a missing file is simply zero."""
+    try:
+        with open(USAGE_PATH, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return "", 0
+    except (OSError, ValueError) as error:
+        logger.warning("Unreadable Alpha Vantage usage file %s: %s; counting from zero", USAGE_PATH, error)
+        return "", 0
+    try:
+        return str(data.get("date", "")), int(data.get("count", 0))
+    except (AttributeError, TypeError, ValueError) as error:
+        logger.warning("Malformed Alpha Vantage usage file %s: %s; counting from zero", USAGE_PATH, error)
+        return "", 0
+
+
+def _write_usage(day: str, count: int) -> None:
+    try:
+        directory = os.path.dirname(USAGE_PATH)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        temporary = f"{USAGE_PATH}.tmp"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump({"date": day, "count": count}, handle)
+        os.replace(temporary, USAGE_PATH)
+    except OSError as error:
+        logger.warning("Could not record Alpha Vantage usage at %s: %s", USAGE_PATH, error)
+
+
+def _respect_free_plan(function_name: str) -> None:
+    """Refuse a premium function, and refuse any call past the daily allowance."""
+    if function_name in PREMIUM_FUNCTIONS:
+        raise AlphaVantagePremiumError(
+            f"Alpha Vantage serves {function_name} on paid plans only; the free plan "
+            f"does not include it, so the call was skipped instead of spending quota."
+        )
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    day, count = _read_usage()
+    if day != today:
+        day, count = today, 0
+    if count >= DAILY_REQUEST_LIMIT:
+        raise AlphaVantageRateLimitError(
+            f"Alpha Vantage free plan allows {DAILY_REQUEST_LIMIT} requests per day; "
+            f"{count} already used today ({today} UTC)."
+        )
+
+
+def _record_request() -> None:
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    day, count = _read_usage()
+    _write_usage(today, 1 if day != today else count + 1)
+
+
+def _pace_request() -> None:
+    """Space requests so a burst does not trip the free plan's throttle."""
+    global _last_request_at
+    elapsed = time.monotonic() - _last_request_at
+    if elapsed < MIN_INTERVAL_SECONDS:
+        time.sleep(MIN_INTERVAL_SECONDS - elapsed)
+    _last_request_at = time.monotonic()
+
+
 def _make_api_request(function_name: str, params: dict) -> dict | str:
     """Helper function to make API requests and handle responses.
 
@@ -75,6 +167,8 @@ def _make_api_request(function_name: str, params: dict) -> dict | str:
     """
     # Create a copy of params to avoid modifying the original
     api_key = get_api_key()
+    _respect_free_plan(function_name)
+    _pace_request()
     api_params = params.copy()
     api_params.update({
         "function": function_name,
@@ -95,6 +189,7 @@ def _make_api_request(function_name: str, params: dict) -> dict | str:
     response = get_scrubbed(
         API_BASE_URL, params=api_params, timeout=REQUEST_TIMEOUT, secret=api_key
     )
+    _record_request()
 
     response_text = response.text
 
@@ -117,7 +212,12 @@ def _make_api_request(function_name: str, params: dict) -> dict | str:
     if notice:
         notice = scrubbed(notice)
         low = notice.lower()
-        if any(m in low for m in ("rate limit", "requests per day", "call frequency", "premium")):
+        if "premium" in low:
+            raise AlphaVantagePremiumError(
+                f"Alpha Vantage refused {function_name}: this endpoint is not on the free "
+                f"plan. Add it to PREMIUM_FUNCTIONS so it is skipped before the request."
+            )
+        if any(m in low for m in ("rate limit", "requests per day", "call frequency")):
             raise AlphaVantageRateLimitError(f"Alpha Vantage rate limit exceeded: {notice}")
         if "api key" in low or "apikey" in low:
             # Reuse the existing "not configured" error so a bad key surfaces as
