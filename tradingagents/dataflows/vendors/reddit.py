@@ -78,6 +78,11 @@ _ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
 # investing trend more measured. Caller can override.
 DEFAULT_SUBREDDITS = ("wallstreetbets", "stocks", "investing")
 
+# A Canadian listing is discussed in Canadian communities far more than in the
+# US defaults, so those are searched alongside them rather than instead of them.
+CANADIAN_SUBREDDITS = ("CanadianInvestor", "PersonalFinanceCanada", "BayStreetBets")
+CANADIAN_SUFFIXES = (".TO", ".V")
+
 # Crypto is discussed in crypto communities, where a coin's own subreddit carries
 # most of it; the stock subreddits above barely mention it.
 CRYPTO_SUBREDDITS = ("CryptoCurrency", "CryptoMarkets")
@@ -85,9 +90,15 @@ _COIN_SUBREDDITS = {"BTC": "Bitcoin", "ETH": "ethereum", "SOL": "solana"}
 
 
 def subreddits_for(ticker: str) -> tuple[str, ...]:
-    """The subreddits searched for ``ticker``: crypto communities for a crypto pair."""
+    """The subreddits searched for ``ticker``: crypto communities for a crypto pair.
+
+    A TSX or TSX-V listing also searches the Canadian communities, where its
+    discussion usually lives.
+    """
     base = crypto_base(ticker)
     if not base:
+        if ticker.strip().upper().endswith(CANADIAN_SUFFIXES):
+            return CANADIAN_SUBREDDITS + DEFAULT_SUBREDDITS
         return DEFAULT_SUBREDDITS
     coin = _COIN_SUBREDDITS.get(base)
     return ((coin,) if coin else ()) + CRYPTO_SUBREDDITS
