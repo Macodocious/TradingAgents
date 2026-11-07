@@ -168,7 +168,7 @@ def build_default_config() -> dict:
             # Statements come from SEC EDGAR as filed (US filers), then Yahoo and
             # Alpha Vantage for the overview and insider tools EDGAR does not serve.
             "fundamental_data": "sec_edgar,yfinance+alpha_vantage",  # Options: sec_edgar, alpha_vantage, yfinance
-            "news_data": "yfinance+alpha_vantage",             # Options: alpha_vantage, yfinance
+            "news_data": "finnhub+yfinance",                   # Options: finnhub, yfinance, alpha_vantage
             "macro_data": "fred",                # Options: fred (needs FRED_API_KEY)
             "prediction_markets": "polymarket",  # Options: polymarket (keyless)
         },

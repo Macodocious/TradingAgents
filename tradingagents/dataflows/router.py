@@ -37,6 +37,7 @@ from tradingagents.dataflows.vendors.yahoo.market import (
     get_stock_stats_indicators_window,
     get_YFin_data_online,
 )
+from tradingagents.dataflows.vendors.finnhub.news import get_news_finnhub
 from tradingagents.dataflows.vendors.yahoo.news import get_global_news_yfinance, get_news_yfinance
 
 logger = logging.getLogger(__name__)
@@ -129,6 +130,7 @@ VENDOR_METHODS = {
     "get_news": {
         "alpha_vantage": get_alpha_vantage_news,
         "yfinance": get_news_yfinance,
+        "finnhub": get_news_finnhub,
     },
     "get_global_news": {
         "yfinance": get_global_news_yfinance,
