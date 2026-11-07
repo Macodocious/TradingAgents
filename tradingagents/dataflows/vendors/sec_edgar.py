@@ -29,6 +29,7 @@ import requests
 
 from tradingagents import __version__
 from tradingagents.dataflows.config import get_config
+from tradingagents.dataflows import fx
 from tradingagents.dataflows.errors import NoMarketDataError, VendorUnavailableError
 from tradingagents.dataflows.files import replace_file
 
@@ -70,6 +71,29 @@ _STATEMENTS: dict[str, list[tuple[str, tuple[str, ...]]]] = {
         ("Financing Cash Flow", ("NetCashProvidedByUsedInFinancingActivities",)),
         ("Capital Expenditure", ("PaymentsToAcquirePropertyPlantAndEquipment",
                                  "PaymentsToAcquireProductiveAssets")),
+    ],
+}
+
+# A 40-F filer reporting under IFRS tags its statements in the ifrs-full
+# namespace instead of us-gaap; Canadian banks are the common case. Only the
+# lines such filers actually tag are listed, so a line they never report reads
+# as untagged rather than as zero. Canadian banks present in liquidity order, so
+# current assets and liabilities have no IFRS element at all.
+_IFRS_STATEMENTS: dict[str, list[tuple[str, tuple[str, ...]]]] = {
+    "balance_sheet": [
+        ("Total Assets", ("Assets",)),
+        ("Cash and Equivalents", ("CashAndCashEquivalents",)),
+        ("Total Liabilities", ("Liabilities",)),
+        ("Stockholders Equity", ("Equity", "EquityAttributableToOwnersOfParent")),
+    ],
+    "income_statement": [
+        ("Revenue", ("Revenue",)),
+        ("Net Income", ("ProfitLoss", "ProfitLossAttributableToOwnersOfParent")),
+    ],
+    "cashflow": [
+        ("Operating Cash Flow", ("CashFlowsFromUsedInOperatingActivities",)),
+        ("Investing Cash Flow", ("CashFlowsFromUsedInInvestingActivities",)),
+        ("Financing Cash Flow", ("CashFlowsFromUsedInFinancingActivities",)),
     ],
 }
 
@@ -134,13 +158,26 @@ def _cached_json(url: str, name: str) -> dict:
 
 
 def cik_for(ticker: str) -> str | None:
-    """The filer's CIK, or None when the ticker is not a US filer."""
+    """The filer's CIK, or None when the ticker is not a US filer.
+
+    A Canadian listing (``SHOP.TO``) is absent from SEC's table under its Yahoo
+    symbol, but a cross-listed issuer files under its bare ticker, so the suffix
+    is dropped and the base symbol retried. Both lookups stay exact matches, and
+    a base symbol the table lists more than once is refused rather than guessed:
+    two companies sharing it would otherwise resolve to whichever came first.
+    """
     table = _cached_json(_TICKERS_URL, "company_tickers.json")
     wanted = ticker.strip().upper()
-    for entry in table.values():
-        if entry.get("ticker", "").upper() == wanted:
-            return f"{int(entry['cik_str']):010d}"
-    return None
+    entries = list(table.values())
+
+    matches = [entry for entry in entries if entry.get("ticker", "").upper() == wanted]
+    if not matches and "." in wanted:
+        base = wanted.split(".", 1)[0]
+        matches = [entry for entry in entries if entry.get("ticker", "").upper() == base]
+
+    if len(matches) != 1:
+        return None
+    return f"{int(matches[0]['cik_str']):010d}"
 
 
 def _span_index(fact: dict, spans: tuple[tuple[int, int], ...]) -> int | None:
@@ -195,9 +232,15 @@ def _statement(kind: str, ticker: str, freq: str, as_of_date: str, title: str) -
         raise NoMarketDataError(ticker, ticker, "not a US SEC filer")
 
     facts = _cached_json(_FACTS_URL.format(cik=cik), f"CIK{cik}.json")
-    us_gaap = (facts.get("facts") or {}).get("us-gaap")
-    if not us_gaap:
-        raise NoMarketDataError(ticker, ticker, "US filer with no us-gaap facts")
+    namespaces = facts.get("facts") or {}
+    if namespaces.get("us-gaap"):
+        company_facts, statements = namespaces["us-gaap"], _STATEMENTS
+    elif namespaces.get("ifrs-full"):
+        # A 40-F filer may report under IFRS rather than US GAAP; Canadian banks
+        # are the common case, and their lines are tagged in ifrs-full.
+        company_facts, statements = namespaces["ifrs-full"], _IFRS_STATEMENTS
+    else:
+        raise NoMarketDataError(ticker, ticker, "US filer with no us-gaap or ifrs-full facts")
 
     quarterly = freq.lower() == "quarterly"
     if quarterly:
@@ -206,7 +249,7 @@ def _statement(kind: str, ticker: str, freq: str, as_of_date: str, title: str) -
     else:
         spans, names = (_SPANS["annual"],), [""]
     forms = () if quarterly else _ANNUAL_FORMS
-    lines = {label: _as_of(us_gaap, tags, as_of_date, spans, forms) for label, tags in _STATEMENTS[kind]}
+    lines = {label: _as_of(company_facts, tags, as_of_date, spans, forms) for label, tags in statements[kind]}
     # Each row takes the shortest span it reports for a period, and a column
     # holds one span of one period, so a row filed only to date keeps its figure
     # beside a row filed by quarter.
@@ -219,9 +262,41 @@ def _statement(kind: str, ticker: str, freq: str, as_of_date: str, title: str) -
         raise NoMarketDataError(ticker, ticker, f"no {freq} {title.lower()} filed by {as_of_date}")
     tagged = {label: line for label, line in lines.items() if line[0]}
     untagged = [label for label in lines if label not in tagged]
+
+    # A statement reports in its filing's currency while the listing quotes in
+    # another; a multiple built by dividing one by the other is wrong by the
+    # exchange rate, so the figures are converted to the quote currency and the
+    # rate is stated. When no rate is available the figures stay as filed and
+    # the header says so, rather than presenting a mixed-currency column.
+    target_currency = fx.quote_currency(ticker)
+    statement_units = {unit.split("/")[0] for _, unit in tagged.values() if unit}
+    conversion_note = ""
+    if len(statement_units) == 1:
+        source_currency = next(iter(statement_units))
+        if source_currency != target_currency:
+            rate = fx.fx_rate(source_currency, target_currency, as_of_date)
+            if rate is None:
+                conversion_note = (
+                    f"# No {source_currency}->{target_currency} rate available for "
+                    f"{as_of_date}; figures remain in {source_currency}\n"
+                )
+            else:
+                rate_on = fx.rate_date(source_currency, target_currency, as_of_date) or as_of_date
+                for label, (values, unit) in list(tagged.items()):
+                    per_share = f"/{unit.split('/', 1)[1]}" if "/" in unit else ""
+                    tagged[label] = (
+                        {key: fx.convert(value, rate) for key, value in values.items()},
+                        f"{target_currency}{per_share}",
+                    )
+                conversion_note = (
+                    f"# Converted from {source_currency} at {rate:.4f} {target_currency} "
+                    f"per {source_currency} ({rate_on})\n"
+                )
+
     header = (
-        f"# {title} for {ticker.upper()} ({freq}), USD in millions unless the column says otherwise\n"
+        f"# {title} for {ticker.upper()} ({freq}), millions in the currency each column names\n"
         f"# SEC EDGAR facts filed on or before {as_of_date}, at the values filed then\n"
+        + conversion_note
         + (f"# Not tagged by this filer: {', '.join(untagged)}\n" if untagged else "")
         + "\n"
     )

@@ -153,15 +153,22 @@ def build_default_config() -> dict:
         # Data vendor configuration
         # Category-level configuration (default for all tools in category).
         # The configured value is the exact vendor chain — requests are NOT silently
-        # routed to vendors you didn't choose. For ordered fallback, list several,
-        # e.g. "yfinance,alpha_vantage". "default" uses all available vendors.
+        # routed to vendors you didn't choose. A comma falls back: the next vendor
+        # is asked only when the previous one could not serve the call. A plus
+        # merges: every vendor in the group is called on every run, the first one
+        # listed is the primary whose answer stands, and the rest contribute only
+        # what it lacks — data already served is never replaced.
+        # "default" uses all available vendors.
         "data_vendors": {
-            "core_stock_apis": "yfinance",       # Options: alpha_vantage, yfinance
-            "technical_indicators": "yfinance",  # Options: alpha_vantage, yfinance
-            # Statements come from SEC EDGAR as filed (US filers), then Yahoo; the
-        # overview and insider tools, which SEC EDGAR does not serve, from Yahoo.
-        "fundamental_data": "sec_edgar,yfinance",  # Options: sec_edgar, alpha_vantage, yfinance
-            "news_data": "yfinance",             # Options: alpha_vantage, yfinance
+            # Yahoo answers first wherever it has a vendor; Alpha Vantage sits
+            # after a "+" so it fills a gap without replacing a Yahoo answer
+            # that already carried data.
+            "core_stock_apis": "yfinance+alpha_vantage",       # Options: alpha_vantage, yfinance
+            "technical_indicators": "yfinance+alpha_vantage",  # Options: alpha_vantage, yfinance
+            # Statements come from SEC EDGAR as filed (US filers), then Yahoo and
+            # Alpha Vantage for the overview and insider tools EDGAR does not serve.
+            "fundamental_data": "sec_edgar,yfinance+alpha_vantage",  # Options: sec_edgar, alpha_vantage, yfinance
+            "news_data": "finnhub+yfinance",                   # Options: finnhub, yfinance, alpha_vantage
             "macro_data": "fred",                # Options: fred (needs FRED_API_KEY)
             "prediction_markets": "polymarket",  # Options: polymarket (keyless)
         },
@@ -196,6 +203,7 @@ def build_default_config() -> dict:
             ".SW":  "^SSMI",       # Switzerland (SMI)
             ".MI":  "FTSEMIB.MI",  # Milan (FTSE MIB)
             ".TO":  "^GSPTSE",     # Toronto (TSX Composite)
+            ".V":   "^SPCDNX",     # TSX Venture (S&P/TSX Venture Composite)
             ".AX":  "^AXJO",       # Australia (ASX 200)
             ".SS":  "000001.SS",   # Shanghai (SSE Composite)
             ".SZ":  "399001.SZ",   # Shenzhen (SZSE Component)

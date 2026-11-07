@@ -39,6 +39,16 @@ DEFAULT_LOOKBACK_DAYS = 365
 # daily series (yields, VIX) over a long window would otherwise flood context.
 MAX_ROWS = 40
 
+# A series whose latest observation is older than its publication cadence is
+# stale: a CPI print from a year ago reads as current to whoever consumes the
+# report. The allowance is the cadence plus room for a normal publication lag.
+_MAX_AGE_DAYS = {"daily": 10, "weekly": 21, "monthly": 75, "quarterly": 180, "annual": 500}
+_DEFAULT_MAX_AGE_DAYS = 400
+
+
+def _max_age_days(frequency: str) -> int:
+    return _MAX_AGE_DAYS.get((frequency or "").strip().lower(), _DEFAULT_MAX_AGE_DAYS)
+
 # Curated human-friendly aliases -> FRED series IDs. Anything not listed is used
 # verbatim as a raw FRED series ID, so power users are never limited to this set.
 MACRO_SERIES = {
@@ -87,6 +97,14 @@ MACRO_SERIES = {
     "germany_10y": "IRLTLT01DEM156N",
     "france_10y": "IRLTLT01FRM156N",
     "eur_usd": "DEXUSEU",
+    # Canada: Bank of Canada policy rate, OECD unemployment and long-term yield,
+    # and the CAD/USD spot rate. No CPI alias: FRED's Canadian CPI series stop at
+    # 2025-03, so an alias would only ever return a stale print.
+    "boc_rate": "IRSTCI01CAM156N",
+    "canada_policy_rate": "IRSTCI01CAM156N",
+    "canada_unemployment": "LRUNTTTTCAM156S",
+    "canada_10y": "IRLTLT01CAM156N",
+    "cad_usd": "DEXCAUS",
 }
 
 
@@ -250,6 +268,34 @@ def get_macro_data(
     )
 
     if not points:
+        # The window can miss every observation when a series stopped publishing
+        # before it. Look wider once so the report can name the last value and
+        # its date as stale, instead of implying the series is empty.
+        wide = _request(
+            "series/observations",
+            {
+                "series_id": series_id,
+                "observation_start": (end_dt - timedelta(days=3650)).strftime("%Y-%m-%d"),
+                "observation_end": as_of_date,
+                "sort_order": "desc",
+                "limit": 1,
+                **realtime,
+            },
+        ).get("observations", [])
+        last = next(
+            ((o.get("date"), o.get("value")) for o in wide
+             if o.get("value") not in (".", None, "")),
+            None,
+        )
+        if last is not None:
+            last_date, last_val = last
+            age_days = (end_dt - datetime.strptime(last_date, "%Y-%m-%d")).days
+            return header + (
+                f"\n**Not used: the latest observation is {last_date} ({last_val}), "
+                f"{age_days} days before {as_of_date}.** Nothing was published in the "
+                f"window, so the series is stale or discontinued and its value is "
+                f"withheld rather than passed on as current.\n"
+            )
         return header + (
             f"\nNo observations for {series_id} in this window at the {pit} "
             f"vintage. The series may report less frequently than the window "
@@ -259,6 +305,18 @@ def get_macro_data(
 
     first_date, first_val = points[0]
     last_date, last_val = points[-1]
+
+    # A stale series is not data this decision can use, so it is reported as
+    # stale and left out instead of being handed over as the latest value.
+    age_days = (end_dt - datetime.strptime(last_date, "%Y-%m-%d")).days
+    stale_after = _max_age_days(frequency)
+    if age_days > stale_after:
+        return header + (
+            f"\n**Not used: the latest observation is {last_date}, {age_days} days "
+            f"before {as_of_date}.** A {frequency.lower()} series publishes within "
+            f"about {stale_after} days, so this value is stale and is withheld rather "
+            f"than passed on as current.\n"
+        )
     try:
         delta = float(last_val) - float(first_val)
         base = float(first_val)

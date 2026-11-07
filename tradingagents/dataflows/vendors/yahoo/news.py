@@ -1,16 +1,20 @@
 """yfinance-based news data fetching functions."""
 
 import contextlib
+import logging
 from datetime import UTC, datetime
 
 import yfinance as yf
 from dateutil.relativedelta import relativedelta
+from yfinance.exceptions import YFDataException
 
 from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.date_window import coverage_gap, in_window
 from tradingagents.dataflows.errors import VendorUnavailableError
 from tradingagents.dataflows.symbols import normalize_symbol
 from tradingagents.dataflows.vendors.yahoo.common import yf_retry
+
+logger = logging.getLogger(__name__)
 
 
 def _extract_article_data(article: dict) -> dict:
@@ -104,7 +108,14 @@ def get_news_yfinance(
     canonical = normalize_symbol(ticker)
     resolved = "" if canonical == ticker else f" (resolved to {canonical})"
     subject = f"news for {ticker}{resolved}"
-    feed = yf_retry(lambda: yf.Ticker(canonical).get_news(count=article_limit)) or []
+    feed: list = []
+    try:
+        feed = yf_retry(lambda: yf.Ticker(canonical).get_news(count=article_limit)) or []
+    except VendorUnavailableError as error:
+        # yf_retry turns the quote feed's failure into this; the search
+        # endpoint is a separate service and still answers, so an outage must
+        # not be reported as an absence of news.
+        logger.warning("Yahoo quote news feed failed for %s: %s", canonical, error)
     articles = [_extract_article_data(a) for a in feed]
     if not feed:
         found, answered = _search_news(canonical, article_limit)

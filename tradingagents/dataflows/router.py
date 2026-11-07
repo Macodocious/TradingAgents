@@ -37,6 +37,7 @@ from tradingagents.dataflows.vendors.yahoo.market import (
     get_stock_stats_indicators_window,
     get_YFin_data_online,
 )
+from tradingagents.dataflows.vendors.finnhub.news import get_news_finnhub
 from tradingagents.dataflows.vendors.yahoo.news import get_global_news_yfinance, get_news_yfinance
 
 logger = logging.getLogger(__name__)
@@ -129,6 +130,7 @@ VENDOR_METHODS = {
     "get_news": {
         "alpha_vantage": get_alpha_vantage_news,
         "yfinance": get_news_yfinance,
+        "finnhub": get_news_finnhub,
     },
     "get_global_news": {
         "yfinance": get_global_news_yfinance,
@@ -197,11 +199,161 @@ def no_data_available(error: NoMarketDataError) -> str:
     )
 
 
+def _call_vendor(method: str, vendor: str, args, kwargs):
+    """One vendor call: (payload, None) on answer, (None, error) on failure."""
+    impl = VENDOR_METHODS[method][vendor]
+    func = impl[0] if isinstance(impl, list) else impl
+    try:
+        return func(*args, **kwargs), None
+    except VendorUnavailableError as e:
+        logger.warning("Vendor %r unavailable for %s: %s", vendor, method, e)
+        return None, e
+    except VendorNotConfiguredError as e:
+        logger.warning("Vendor %r not configured for %s", vendor, method)
+        return None, e
+    except NoMarketDataError as e:
+        return None, e
+    except Exception as e:
+        logger.warning("Vendor %r failed for %s: %s", vendor, method, e)
+        return None, e
+
+
+def _merge_payloads(pairs: list[tuple[str, object]]):
+    """Combine vendor answers without ever dropping the primary's content.
+
+    The first vendor in the group is the primary: its answer stands, and later
+    vendors contribute only what it does not already carry. A key the primary
+    set is never overwritten, and text already present is not repeated.
+    """
+    usable = [(vendor, payload) for vendor, payload in pairs if not _is_gap(payload)]
+    if not usable:
+        return None
+    _, primary = usable[0]
+    if len(usable) == 1:
+        return primary
+
+    if isinstance(primary, dict):
+        merged = dict(primary)
+        for vendor, payload in usable[1:]:
+            if isinstance(payload, dict):
+                for key, value in payload.items():
+                    merged.setdefault(key, value)
+            elif str(payload).strip():
+                merged.setdefault(f"supplement_{vendor}", payload)
+        return merged
+
+    if isinstance(primary, str):
+        text = primary
+        for vendor, payload in usable[1:]:
+            extra = payload if isinstance(payload, str) else str(payload)
+            if extra.strip() and extra.strip() not in text:
+                text += f"\n\n---\n\n## Supplemental data from {vendor}\n\n{extra.strip()}"
+        return text
+
+    return primary
+
+
+def _route_with_merge(method: str, vendor_config: str, *args, **kwargs):
+    """Run every vendor in each '+' group and merge, then fall to the next group.
+
+    Every vendor in a group is called on every run, so a healthy primary still
+    receives whatever the others can add. A group that yields nothing usable
+    moves the call to the next comma-separated group.
+    """
+    category = get_category_for_method(method)
+    if method not in VENDOR_METHODS:
+        raise ValueError(f"Method '{method}' not supported")
+    available = VENDOR_METHODS[method]
+
+    groups = [
+        [name.strip() for name in part.split("+") if name.strip()]
+        for part in vendor_config.split(",")
+    ]
+    # A vendor named at the category level may have no implementation for this
+    # tool (sec_edgar serves statements but not the overview), so drop it here
+    # rather than failing a chain that is valid for its siblings.
+    groups = [
+        [name for name in group if name == "default" or name in available]
+        for group in groups
+    ]
+    groups = [group for group in groups if group]
+    if not groups:
+        raise ValueError(
+            f"Configured vendor(s) {vendor_config} not available for '{method}'. "
+            f"Available: {list(available)}."
+        )
+    if not any(name != "default" for group in groups for name in group):
+        groups = [list(available)]
+
+    last_gap = None
+    last_no_data: NoMarketDataError | None = None
+    last_unavailable: VendorUnavailableError | None = None
+    first_error: Exception | None = None
+
+    for group in groups:
+        names = [name for name in group if name in available]
+        if not names:
+            continue
+        pairs = []
+        for vendor in names:
+            payload, error = _call_vendor(method, vendor, args, kwargs)
+            if error is not None:
+                if isinstance(error, VendorUnavailableError):
+                    last_unavailable = error
+                elif isinstance(error, NoMarketDataError):
+                    last_no_data = error
+                if first_error is None:
+                    first_error = error
+                continue
+            pairs.append((vendor, payload))
+        merged = _merge_payloads(pairs)
+        if merged is not None and not _is_gap(merged):
+            return merged
+        if merged is not None:
+            last_gap = merged
+
+    if last_unavailable is not None:
+        return vendor_unavailable(method, last_unavailable)
+    if last_gap is not None:
+        return last_gap
+    if last_no_data is not None:
+        return no_data_available(last_no_data)
+    if first_error is not None:
+        if category in OPTIONAL_CATEGORIES:
+            logger.warning("Optional %s unavailable for %s: %s", category, method, first_error)
+            return (
+                f"DATA_UNAVAILABLE: optional {category} could not be retrieved "
+                f"({first_error}). Proceed without it; do not fabricate values."
+            )
+        raise first_error
+    raise RuntimeError(f"No available vendor for '{method}'")
+
+
+# A vendor answer that carries no data: a point-in-time withholding notice, an
+# all-vendor-unavailable sentinel, or an empty payload. These are the gaps a
+# later vendor in the chain is allowed to fill.
+_GAP_MARKERS = ("# Point-in-time as of:", "DATA_UNAVAILABLE", "NO_DATA_AVAILABLE")
+
+
+def _is_gap(result) -> bool:
+    """True when a vendor answered without serving any data."""
+    if result is None:
+        return True
+    if isinstance(result, dict):
+        return not result
+    if isinstance(result, str):
+        text = result.strip()
+        return not text or any(marker in text[:400] for marker in _GAP_MARKERS)
+    return False
+
+
 def route_to_vendor(method: str, *args, **kwargs):
     """Route method calls to appropriate vendor implementation with fallback support."""
     category = get_category_for_method(method)
     vendor_config = get_vendor(category, method)
-    primary_vendors = [v.strip() for v in vendor_config.split(',')]
+    if "+" in str(vendor_config):
+        return _route_with_merge(method, str(vendor_config), *args, **kwargs)
+    primary_vendors = [v.strip() for v in vendor_config.replace("+", ",").split(",")]
 
     if method not in VENDOR_METHODS:
         raise ValueError(f"Method '{method}' not supported")
@@ -228,12 +380,13 @@ def route_to_vendor(method: str, *args, **kwargs):
     last_unavailable: VendorUnavailableError | None = None
     failed: Exception | None = None     # a vendor that raised something untyped
     first_error: Exception | None = None
+    gap_result: str | None = None    # last answer that carried no data
     for vendor in vendor_chain:
         vendor_impl = VENDOR_METHODS[method][vendor]
         impl_func = vendor_impl[0] if isinstance(vendor_impl, list) else vendor_impl
 
         try:
-            return impl_func(*args, **kwargs)
+            result = impl_func(*args, **kwargs)
         except VendorUnavailableError as e:
             logger.warning("Vendor %r unavailable for %s: %s; trying next vendor.", vendor, method, e)
             # Kept so an all-unavailable chain can say the vendor was the
@@ -257,6 +410,14 @@ def route_to_vendor(method: str, *args, **kwargs):
                 first_error = e
             failed = e
             continue
+        if _is_gap(result):
+            logger.info(
+                "Vendor %r answered %s with no data; the next vendor in the chain may fill it.",
+                vendor, method,
+            )
+            gap_result = result
+            continue
+        return result
 
     # A vendor that throttled or failed the request never said whether it has
     # the symbol, so no other vendor's "no data" can speak for the whole chain:
@@ -264,7 +425,7 @@ def route_to_vendor(method: str, *args, **kwargs):
     # the run either.
     if last_unavailable is not None:
         return vendor_unavailable(method, last_unavailable)
-    if failed is not None and last_no_data is not None:
+    if failed is not None and (last_no_data is not None or gap_result is not None):
         return vendor_unavailable(method, failed)
 
     # Every vendor that answered reported "no data": the symbol is genuinely unavailable.
@@ -280,6 +441,11 @@ def route_to_vendor(method: str, *args, **kwargs):
                 method, first_error,
             )
         return no_data_available(last_no_data)
+
+    # Every vendor answered without serving data: hand back the last notice so
+    # the agent sees the real reason (point-in-time withholding included).
+    if gap_result is not None:
+        return gap_result
 
     # No vendor returned data and none reported clean "no data" — surface the
     # first real error (e.g. the primary vendor's network failure). Optional
